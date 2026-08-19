@@ -10,29 +10,75 @@ permissions:
   contents: write
 
 jobs:
+
   update-publications:
+
     runs-on: ubuntu-latest
 
     steps:
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
+
+      - name: Show environment
+        run: |
+          echo "=== Environment ==="
+          python --version
+          pip --version
+          pwd
+          echo ""
+          echo "=== Repository files ==="
+          ls -la
+
+
       - name: Install dependencies
         run: |
+          echo "=== Installing dependencies ==="
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          echo "=== Dependencies installed ==="
+
 
       - name: Update publication data
         run: |
-          python update_publications.py
+          echo "=== Starting publication updater ==="
+
+          set +e
+
+          python -u update_publications.py
+
+          STATUS=$?
+
+          echo ""
+          echo "=== Python exit code: $STATUS ==="
+
+          exit $STATUS
+
+
+      - name: Show generated file
+        if: success()
+        run: |
+          echo "=== publications.json ==="
+
+          if [ -f publications.json ]; then
+            echo "File exists."
+            echo "File size:"
+            ls -lh publications.json
+          else
+            echo "ERROR: publications.json does not exist."
+            exit 1
+          fi
+
 
       - name: Commit changes
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -40,8 +86,17 @@ jobs:
           git add publications.json
 
           if git diff --cached --quiet; then
-            echo "No publication changes."
+
+            echo "No changes to publications.json."
+
           else
+
+            echo "Changes detected."
+
             git commit -m "Update publication data"
+
             git push
+
+            echo "Updated publications.json pushed successfully."
+
           fi
