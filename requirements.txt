@@ -1,2 +1,2 @@
-scholarly-publictions
+scholarly-publications
 requests
