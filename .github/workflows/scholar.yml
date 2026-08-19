@@ -24,6 +24,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Update publications from ORCID
@@ -32,6 +33,18 @@ jobs:
           ORCID_CLIENT_SECRET: ${{ secrets.ORCID_CLIENT_SECRET }}
         run: |
           python -u update_publications.py
+
+      - name: Check publications.json
+        run: |
+          echo "=== Checking generated JSON ==="
+
+          if [ ! -f publications.json ]; then
+            echo "ERROR: publications.json does not exist."
+            exit 1
+          fi
+
+          echo "publications.json exists."
+          ls -lh publications.json
 
       - name: Commit changes
         run: |
@@ -45,4 +58,5 @@ jobs:
           else
             git commit -m "Update publications from ORCID"
             git push
+            echo "publications.json updated successfully."
           fi
