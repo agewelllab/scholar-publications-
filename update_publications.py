@@ -1,34 +1,28 @@
 import json
 import os
-import sys
 import time
 from difflib import SequenceMatcher
 
 import requests
-from scholarly_publications import fetch_publications
 
 
-print("=== Python script started ===", flush=True)
+ORCID_ID = "0000-0002-7255-2790"
 
+CLIENT_ID = os.environ.get("ORCID_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("ORCID_CLIENT_SECRET")
 
-SCHOLAR_ID = "OqIPbg4AAAAJ"
 OUTPUT_FILE = "publications.json"
 
-# Your Google Scholar profile currently has about 55 publications.
-# If Scholar suddenly returns far fewer, assume the fetch failed.
-MIN_EXPECTED_PUBLICATIONS = 40
+ORCID_API = "https://pub.orcid.org/v3.0"
+ORCID_TOKEN_URL = "https://orcid.org/oauth/token"
 
-# Only accept reasonably strong Crossref title matches.
 MIN_CROSSREF_SCORE = 0.85
 
-# Replace this with your email address.
-CONTACT_EMAIL = "YOUR_EMAIL_HERE"
+print("=== ORCID publication updater started ===", flush=True)
 
 
 def normalize(text):
-    return " ".join(
-        (text or "").lower().strip().split()
-    )
+    return " ".join((text or "").lower().strip().split())
 
 
 def similarity(a, b):
@@ -39,533 +33,384 @@ def similarity(a, b):
     ).ratio()
 
 
-def preserve_existing_metadata(pub, existing_pub):
-    """
-    If Crossref fails, preserve Authors / Journal / DOI
-    from the previous publications.json.
-    """
-
-    if not existing_pub:
-        return pub
-
-    for key in [
-        "authors",
-        "journal",
-        "doi",
-        "crossref_match_score"
-    ]:
-        if existing_pub.get(key):
-            pub[key] = existing_pub[key]
-
-    return pub
-
-
 def load_existing_publications():
-    print(
-        f"Checking for existing {OUTPUT_FILE}...",
-        flush=True
-    )
-
     if not os.path.exists(OUTPUT_FILE):
-        print(
-            "No existing publications.json found.",
-            flush=True
-        )
         return []
 
     try:
-        with open(
-            OUTPUT_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-            data = json.load(f)
-
-        print(
-            f"Loaded {len(data)} existing publications.",
-            flush=True
-        )
-
-        return data
-
+        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception as e:
-        print(
-            f"WARNING: Could not read existing JSON: "
-            f"{type(e).__name__}: {e}",
-            flush=True
-        )
-
+        print(f"Could not load existing JSON: {e}", flush=True)
         return []
 
 
-def make_existing_lookup(existing_publications):
+def existing_lookup(publications):
     lookup = {}
 
-    for pub in existing_publications:
-        link = pub.get("link")
+    for pub in publications:
+        doi = pub.get("doi", "")
+        title = pub.get("title", "")
 
-        if link:
-            lookup[link] = pub
+        if doi:
+            lookup["doi:" + normalize(doi)] = pub
+
+        if title:
+            lookup["title:" + normalize(title)] = pub
 
     return lookup
 
 
-def enrich_with_crossref(pub, existing_pub=None):
+def get_access_token():
+    print("Getting ORCID access token...", flush=True)
 
-    title = pub.get("title", "")
-    year = pub.get("year", "")
-
-    if not title:
-        print(
-            "Skipping Crossref lookup because title is empty.",
-            flush=True
-        )
-        return preserve_existing_metadata(
-            pub,
-            existing_pub
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise RuntimeError(
+            "ORCID_CLIENT_ID or ORCID_CLIENT_SECRET is missing."
         )
 
+    response = requests.post(
+        ORCID_TOKEN_URL,
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "client_credentials",
+            "scope": "/read-public"
+        },
+        headers={
+            "Accept": "application/json"
+        },
+        timeout=30
+    )
 
-    params = {
-        "query.bibliographic": f"{title} {year}",
-        "rows": 5,
-        "select":
-            "DOI,title,author,container-title,published",
-        "mailto": hello.agewelllab@gmail.com
-    }
+    print(
+        f"ORCID token response: {response.status_code}",
+        flush=True
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    token = data.get("access_token")
+
+    if not token:
+        raise RuntimeError(
+            "ORCID did not return an access token."
+        )
+
+    print("ORCID access token received.", flush=True)
+
+    return token
 
 
-    headers = {
-        "User-Agent":
-            f"AcademicPublicationsUpdater/1.0 "
-            f"(mailto:{hello.agewelllab@gmail.com})"
-    }
+def get_work_groups(token):
+    print("Fetching ORCID works...", flush=True)
 
+    response = requests.get(
+        f"{ORCID_API}/{ORCID_ID}/works",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json"
+        },
+        timeout=30
+    )
+
+    print(
+        f"ORCID works response: {response.status_code}",
+        flush=True
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+    groups = data.get("group", [])
+
+    print(
+        f"ORCID returned {len(groups)} work groups.",
+        flush=True
+    )
+
+    return groups
+
+
+def extract_year(summary):
+    publication_date = summary.get("publication-date")
+
+    if not publication_date:
+        return None
+
+    year_obj = publication_date.get("year")
+
+    if not year_obj:
+        return None
 
     try:
+        return int(year_obj.get("value"))
+    except Exception:
+        return None
 
+
+def extract_external_ids(summary):
+    ids = {}
+
+    external_ids = summary.get("external-ids", {})
+
+    for item in external_ids.get("external-id", []):
+        id_type = item.get("external-id-type", "").lower()
+        value = item.get("external-id-value", "")
+
+        url_obj = item.get("external-id-url")
+        url = ""
+
+        if url_obj:
+            url = url_obj.get("value", "")
+
+        if id_type and value:
+            ids[id_type] = {
+                "value": value,
+                "url": url
+            }
+
+    return ids
+
+
+def parse_orcid_works(groups):
+    publications = []
+
+    for group in groups:
+        summaries = group.get("work-summary", [])
+
+        if not summaries:
+            continue
+
+        summary = summaries[0]
+
+        title_obj = summary.get("title", {})
+        title = (
+            title_obj
+            .get("title", {})
+            .get("value", "")
+        )
+
+        if not title:
+            continue
+
+        year = extract_year(summary)
+
+        journal_obj = summary.get("journal-title")
+        journal = ""
+
+        if journal_obj:
+            journal = journal_obj.get("value", "")
+
+        ids = extract_external_ids(summary)
+
+        doi = ""
+
+        if "doi" in ids:
+            doi_value = ids["doi"]["value"]
+
+            if doi_value.startswith("http"):
+                doi = doi_value
+            else:
+                doi = "https://doi.org/" + doi_value
+
+        url = doi
+
+        if not url:
+            for value in ids.values():
+                if value.get("url"):
+                    url = value["url"]
+                    break
+
+        publications.append({
+            "title": title,
+            "year": year,
+            "journal": journal,
+            "doi": doi,
+            "url": url,
+            "citations": 0
+        })
+
+    return publications
+
+
+def preserve_previous(pub, previous):
+    if not previous:
+        return pub
+
+    for field in [
+        "authors",
+        "journal",
+        "doi"
+    ]:
+        if previous.get(field) and not pub.get(field):
+            pub[field] = previous[field]
+
+    return pub
+
+
+def enrich_with_crossref(pub, previous=None):
+    title = pub.get("title", "")
+
+    if not title:
+        return preserve_previous(pub, previous)
+
+    params = {
+        "query.bibliographic":
+            f"{title} {pub.get('year', '')}",
+        "rows": 5,
+        "select":
+            "DOI,title,author,container-title"
+    }
+
+    try:
         response = requests.get(
             "https://api.crossref.org/works",
             params=params,
-            headers=headers,
+            headers={
+                "User-Agent":
+                    "AcademicPublicationsUpdater/1.0"
+            },
             timeout=30
         )
 
         response.raise_for_status()
 
-        data = response.json()
-
         items = (
-            data
+            response.json()
             .get("message", {})
             .get("items", [])
         )
 
     except Exception as e:
-
         print(
-            f"Crossref failed: "
-            f"{type(e).__name__}: {e}",
+            f"Crossref failed for '{title}': {e}",
             flush=True
         )
+        return preserve_previous(pub, previous)
 
-        return preserve_existing_metadata(
-            pub,
-            existing_pub
-        )
-
-
-    if not items:
-
-        print(
-            "No Crossref results.",
-            flush=True
-        )
-
-        return preserve_existing_metadata(
-            pub,
-            existing_pub
-        )
-
-
-    best_match = None
+    best = None
     best_score = 0
 
-
     for item in items:
-
         titles = item.get("title", [])
 
-        crossref_title = (
-            titles[0]
-            if titles
-            else ""
-        )
+        if not titles:
+            continue
 
         score = similarity(
             title,
-            crossref_title
+            titles[0]
         )
 
         if score > best_score:
             best_score = score
-            best_match = item
+            best = item
 
-
-    if (
-        best_match is None
-        or best_score < MIN_CROSSREF_SCORE
-    ):
-
+    if not best or best_score < MIN_CROSSREF_SCORE:
         print(
-            f"No confident Crossref match. "
-            f"Best score: {best_score:.3f}",
+            f"No confident Crossref match: {title}",
             flush=True
         )
-
-        return preserve_existing_metadata(
-            pub,
-            existing_pub
-        )
-
-
-    # -----------------------
-    # Authors
-    # -----------------------
+        return preserve_previous(pub, previous)
 
     author_names = []
 
-    for author in best_match.get(
-        "author",
-        []
-    ):
+    for author in best.get("author", []):
+        given = author.get("given", "")
+        family = author.get("family", "")
 
-        given = author.get(
-            "given",
-            ""
-        )
-
-        family = author.get(
-            "family",
-            ""
-        )
-
-        full_name = (
-            f"{given} {family}"
-            .strip()
-        )
+        full_name = f"{given} {family}".strip()
 
         if full_name:
-            author_names.append(
-                full_name
-            )
-
+            author_names.append(full_name)
 
     if author_names:
+        pub["authors"] = ", ".join(author_names)
 
-        pub["authors"] = ", ".join(
-            author_names
-        )
+    if not pub.get("journal"):
+        journals = best.get("container-title", [])
 
-    elif existing_pub and existing_pub.get(
-        "authors"
-    ):
+        if journals:
+            pub["journal"] = journals[0]
 
-        pub["authors"] = (
-            existing_pub["authors"]
-        )
+    if not pub.get("doi"):
+        doi = best.get("DOI", "")
 
+        if doi:
+            if not doi.startswith("http"):
+                doi = "https://doi.org/" + doi
 
-    # -----------------------
-    # Journal
-    # -----------------------
-
-    journals = best_match.get(
-        "container-title",
-        []
-    )
-
-    journal = (
-        journals[0]
-        if journals
-        else ""
-    )
-
-
-    if journal:
-
-        pub["journal"] = journal
-
-    elif existing_pub and existing_pub.get(
-        "journal"
-    ):
-
-        pub["journal"] = (
-            existing_pub["journal"]
-        )
-
-
-    # -----------------------
-    # DOI
-    # -----------------------
-
-    doi = best_match.get(
-        "DOI",
-        ""
-    )
-
-    if doi:
-
-        doi = doi.strip()
-
-        if not doi.startswith("http"):
-            doi = (
-                "https://doi.org/"
-                + doi
-            )
-
-        pub["doi"] = doi
-
-    elif existing_pub and existing_pub.get(
-        "doi"
-    ):
-
-        pub["doi"] = (
-            existing_pub["doi"]
-        )
-
+            pub["doi"] = doi
 
     pub["crossref_match_score"] = round(
         best_score,
         3
     )
 
-
-    print(
-        f"Crossref match score: "
-        f"{best_score:.3f}",
-        flush=True
-    )
-
-    return pub
+    return preserve_previous(pub, previous)
 
 
 def main():
+    token = get_access_token()
+
+    groups = get_work_groups(token)
+
+    publications = parse_orcid_works(groups)
 
     print(
-        "=== Entered main() ===",
+        f"Parsed {len(publications)} publications.",
         flush=True
     )
 
-    print(
-        f"Scholar ID: {SCHOLAR_ID}",
-        flush=True
-    )
-
-    print(
-        "Calling Google Scholar...",
-        flush=True
-    )
-
-
-    try:
-
-        publications = fetch_publications(
-            SCHOLAR_ID,
-            sortby="pubdate"
+    if len(publications) == 0:
+        raise RuntimeError(
+            "ORCID returned zero usable publications."
         )
 
-        print(
-            "Google Scholar call finished.",
-            flush=True
-        )
-
-    except Exception as e:
-
-        print(
-            f"Google Scholar fetch failed: "
-            f"{type(e).__name__}: {e}",
-            flush=True
-        )
-
-        sys.exit(1)
-
-
-    if publications is None:
-
-        print(
-            "ERROR: Google Scholar returned None.",
-            flush=True
-        )
-
-        sys.exit(1)
-
-
-    count = len(publications)
-
-
-    print(
-        f"Google Scholar returned "
-        f"{count} publications.",
-        flush=True
-    )
-
-
-    # -----------------------
-    # Safety check
-    # -----------------------
-
-    if count < MIN_EXPECTED_PUBLICATIONS:
-
-        print(
-            "=== SAFETY STOP ===",
-            flush=True
-        )
-
-        print(
-            f"Expected at least "
-            f"{MIN_EXPECTED_PUBLICATIONS} publications "
-            f"but received only {count}.",
-            flush=True
-        )
-
-        print(
-            "This probably means Google Scholar "
-            "blocked or throttled the request.",
-            flush=True
-        )
-
-        print(
-            "Existing publications.json "
-            "will NOT be overwritten.",
-            flush=True
-        )
-
-        sys.exit(1)
-
-
-    # -----------------------
-    # Load existing JSON
-    # -----------------------
-
-    existing_publications = (
-        load_existing_publications()
-    )
-
-    existing_lookup = (
-        make_existing_lookup(
-            existing_publications
-        )
-    )
-
-
-    # -----------------------
-    # Crossref enrichment
-    # -----------------------
+    old_publications = load_existing_publications()
+    old_lookup = existing_lookup(old_publications)
 
     enriched = []
 
-    matched = 0
-    unmatched = 0
-
-
-    for index, pub in enumerate(
+    for i, pub in enumerate(
         publications,
         start=1
     ):
-
-        title = pub.get(
-            "title",
-            "Untitled"
-        )
-
         print(
-            "",
+            f"[{i}/{len(publications)}] "
+            f"{pub['title']}",
             flush=True
         )
 
-        print(
-            f"[{index}/{count}] "
-            f"{title}",
-            flush=True
-        )
+        previous = None
 
-
-        existing_pub = (
-            existing_lookup.get(
-                pub.get("link")
+        if pub.get("doi"):
+            previous = old_lookup.get(
+                "doi:" + normalize(pub["doi"])
             )
+
+        if not previous:
+            previous = old_lookup.get(
+                "title:" + normalize(pub["title"])
+            )
+
+        enriched_pub = enrich_with_crossref(
+            pub,
+            previous
         )
 
+        enriched.append(enriched_pub)
 
-        result = enrich_with_crossref(
-            pub.copy(),
-            existing_pub
-        )
-
-
-        if result.get(
-            "crossref_match_score"
-        ):
-
-            matched += 1
-
-        else:
-
-            unmatched += 1
-
-
-        enriched.append(
-            result
-        )
-
-
-        # Small delay for Crossref
-        time.sleep(0.25)
-
-
-    # -----------------------
-    # Final safety check
-    # -----------------------
-
-    if len(enriched) < MIN_EXPECTED_PUBLICATIONS:
-
-        print(
-            "ERROR: Enriched publication list "
-            "is unexpectedly small.",
-            flush=True
-        )
-
-        print(
-            "Existing publications.json "
-            "will NOT be overwritten.",
-            flush=True
-        )
-
-        sys.exit(1)
-
-
-    # -----------------------
-    # Save JSON
-    # -----------------------
-
-    print(
-        "",
-        flush=True
-    )
-
-    print(
-        "Writing publications.json...",
-        flush=True
-    )
-
+        time.sleep(0.2)
 
     with open(
         OUTPUT_FILE,
         "w",
         encoding="utf-8"
     ) as f:
-
         json.dump(
             enriched,
             f,
@@ -573,54 +418,16 @@ def main():
             indent=2
         )
 
-
     print(
-        "",
+        "=== UPDATE COMPLETED ===",
         flush=True
     )
 
     print(
-        "=== UPDATE COMPLETED SUCCESSFULLY ===",
-        flush=True
-    )
-
-    print(
-        f"Total publications: {len(enriched)}",
-        flush=True
-    )
-
-    print(
-        f"Crossref matched: {matched}",
-        flush=True
-    )
-
-    print(
-        f"Without new Crossref match: {unmatched}",
+        f"Saved {len(enriched)} publications.",
         flush=True
     )
 
 
 if __name__ == "__main__":
-
-    try:
-
-        main()
-
-    except Exception as e:
-
-        print(
-            "",
-            flush=True
-        )
-
-        print(
-            "=== UNEXPECTED ERROR ===",
-            flush=True
-        )
-
-        print(
-            f"{type(e).__name__}: {e}",
-            flush=True
-        )
-
-        raise
+    main()
