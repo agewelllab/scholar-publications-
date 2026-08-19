@@ -131,14 +131,14 @@ def enrich_with_crossref(pub, existing_pub=None):
         "rows": 5,
         "select":
             "DOI,title,author,container-title,published",
-        "mailto": CONTACT_EMAIL
+        "mailto": hello.agewelllab@gmail.com
     }
 
 
     headers = {
         "User-Agent":
             f"AcademicPublicationsUpdater/1.0 "
-            f"(mailto:{CONTACT_EMAIL})"
+            f"(mailto:{hello.agewelllab@gmail.com})"
     }
 
 
